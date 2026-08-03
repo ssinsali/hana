@@ -12,6 +12,7 @@ import json
 import re
 import secrets
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -22,10 +23,22 @@ _APP_DIR = Path(__file__).resolve().parent
 USERS_PATH = _APP_DIR / "data" / "users.json"
 
 _USERNAME_RE = re.compile(r"^[a-zA-Z0-9._-]{3,32}$")
+_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _MIN_PASSWORD_LEN = 8
 _PBKDF2_ITERATIONS = 260_000
 _HASH_PREFIX = "pbkdf2_sha256"
 _GH_API = "https://api.github.com"
+_PLACEHOLDER_TOKENS = (
+    "github_pat_xxxxxxxx",
+    "ghp_xxxxxxxx",
+    "발급한_토큰",
+    "YOUR_TOKEN",
+)
+_PLACEHOLDER_REPOS = (
+    "계정명/저장소명",
+    "YOUR_GITHUB_ID/REPO",
+    "owner/repo",
+)
 
 
 def _auth_secret(key: str, default: str | None = None) -> str | None:
@@ -53,15 +66,57 @@ def _github_secret(key: str, default: str | None = None) -> str | None:
 
 
 def github_store_enabled() -> bool:
-    return bool(_github_secret("token") and _github_secret("repo"))
+    token = _github_secret("token") or ""
+    repo = (_github_secret("repo") or "").strip().strip("/")
+    if not token or not repo:
+        return False
+    if token in _PLACEHOLDER_TOKENS or token.startswith("github_pat_xxx"):
+        return False
+    if repo in _PLACEHOLDER_REPOS:
+        return False
+    return True
 
 
 def _github_cfg() -> tuple[str, str, str, str]:
-    token = _github_secret("token") or ""
+    token = (_github_secret("token") or "").strip()
     repo = (_github_secret("repo") or "").strip().strip("/")
-    path = (_github_secret("path") or "data/users.json").lstrip("/")
-    branch = _github_secret("branch") or "main"
+    path = (_github_secret("path") or "data/users.json").strip().lstrip("/")
+    branch = (_github_secret("branch") or "main").strip() or "main"
+
+    if not token or token in _PLACEHOLDER_TOKENS:
+        raise RuntimeError(
+            "Secrets [github].token 이 비어 있거나 예시값입니다. "
+            "GitHub에서 발급한 실제 토큰을 넣어 주세요."
+        )
+    if not repo or repo in _PLACEHOLDER_REPOS:
+        raise RuntimeError(
+            "Secrets [github].repo 에는 실제 저장소를 영문으로 넣으세요. "
+            "예: myid/hana  (계정명/저장소명 같은 한글 예시는 사용할 수 없습니다.)"
+        )
+    if not _REPO_RE.match(repo):
+        raise RuntimeError(
+            f"Secrets [github].repo 형식이 올바르지 않습니다: {repo!r}. "
+            "영문 owner/repo 형식이어야 합니다. 예: myid/hana"
+        )
+    try:
+        path.encode("ascii")
+        branch.encode("ascii")
+    except UnicodeEncodeError as e:
+        raise RuntimeError(
+            "Secrets [github].path / branch 에는 영문·숫자만 사용하세요."
+        ) from e
     return token, repo, path, branch
+
+
+def _contents_url(repo: str, path: str, branch: str | None = None) -> str:
+    # path 세그먼트만 인코딩 (슬래시는 경로 구분자로 유지)
+    encoded_path = "/".join(
+        urllib.parse.quote(part, safe="") for part in path.split("/") if part
+    )
+    url = f"{_GH_API}/repos/{repo}/contents/{encoded_path}"
+    if branch:
+        url += f"?ref={urllib.parse.quote(branch, safe='')}"
+    return url
 
 
 def _normalize_users(raw: Any) -> dict[str, Any]:
@@ -91,6 +146,11 @@ def _github_request(
         with urllib.request.urlopen(req, timeout=30) as resp:
             raw = resp.read().decode("utf-8")
             return json.loads(raw) if raw else {}
+    except UnicodeEncodeError as e:
+        raise RuntimeError(
+            "GitHub 요청 URL에 한글 등 비ASCII 문자가 있습니다. "
+            "Secrets의 repo 값을 영문 owner/repo 로 바꿔 주세요. 예: myid/hana"
+        ) from e
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"GitHub API {e.code}: {detail}") from e
@@ -116,7 +176,7 @@ def _save_users_local(data: dict[str, Any]) -> None:
 def _fetch_github_users() -> tuple[dict[str, Any], str | None]:
     """(users_data, sha). 파일이 없으면 빈 DB와 sha=None."""
     token, repo, path, branch = _github_cfg()
-    url = f"{_GH_API}/repos/{repo}/contents/{path}?ref={branch}"
+    url = _contents_url(repo, path, branch)
     try:
         info = _github_request("GET", url, token)
     except RuntimeError as e:
@@ -133,7 +193,7 @@ def _fetch_github_users() -> tuple[dict[str, Any], str | None]:
 
 def _push_github_users(data: dict[str, Any], sha: str | None) -> None:
     token, repo, path, branch = _github_cfg()
-    url = f"{_GH_API}/repos/{repo}/contents/{path}"
+    url = _contents_url(repo, path)
     content = base64.b64encode(
         (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
     ).decode("ascii")
