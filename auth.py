@@ -33,12 +33,16 @@ _PLACEHOLDER_TOKENS = (
     "ghp_xxxxxxxx",
     "발급한_토큰",
     "YOUR_TOKEN",
+    "github_pat_여기에실제토큰",
+    "github_pat_실제발급토큰",
 )
 _PLACEHOLDER_REPOS = (
     "계정명/저장소명",
     "YOUR_GITHUB_ID/REPO",
+    "YOUR_GITHUB_ID/hana",
     "owner/repo",
 )
+_TOKEN_RE = re.compile(r"^(ghp_|github_pat_)[A-Za-z0-9_]+$")
 
 
 def _auth_secret(key: str, default: str | None = None) -> str | None:
@@ -70,33 +74,49 @@ def github_store_enabled() -> bool:
     repo = (_github_secret("repo") or "").strip().strip("/")
     if not token or not repo:
         return False
-    if token in _PLACEHOLDER_TOKENS or token.startswith("github_pat_xxx"):
+    if token in _PLACEHOLDER_TOKENS or "실제" in token or "xxxxxxxx" in token:
+        return False
+    if not _TOKEN_RE.match(token):
         return False
     if repo in _PLACEHOLDER_REPOS:
+        return False
+    if not _REPO_RE.match(repo):
         return False
     return True
 
 
 def _github_cfg() -> tuple[str, str, str, str]:
-    token = (_github_secret("token") or "").strip()
-    repo = (_github_secret("repo") or "").strip().strip("/")
+    token = (_github_secret("token") or "").strip().strip('"').strip("'")
+    repo = (_github_secret("repo") or "").strip().strip("/").strip('"').strip("'")
     path = (_github_secret("path") or "data/users.json").strip().lstrip("/")
     branch = (_github_secret("branch") or "main").strip() or "main"
 
-    if not token or token in _PLACEHOLDER_TOKENS:
+    if not token or token in _PLACEHOLDER_TOKENS or "실제" in token:
         raise RuntimeError(
-            "Secrets [github].token 이 비어 있거나 예시값입니다. "
-            "GitHub에서 발급한 실제 토큰을 넣어 주세요."
+            "Secrets [github].token 에 예시 문구가 들어 있습니다. "
+            "GitHub에서 Generate 한 뒤 복사한 실제 토큰(영문·숫자, github_pat_... 또는 ghp_...)을 넣으세요."
+        )
+    try:
+        token.encode("ascii")
+    except UnicodeEncodeError as e:
+        raise RuntimeError(
+            "Secrets [github].token 에 한글이 들어가 있습니다. "
+            "예시 문구가 아니라 GitHub에서 발급한 실제 토큰만 넣으세요."
+        ) from e
+    if not _TOKEN_RE.match(token):
+        raise RuntimeError(
+            "Secrets [github].token 형식이 올바르지 않습니다. "
+            "github_pat_... 또는 ghp_... 로 시작하는 실제 토큰이어야 합니다."
         )
     if not repo or repo in _PLACEHOLDER_REPOS:
         raise RuntimeError(
             "Secrets [github].repo 에는 실제 저장소를 영문으로 넣으세요. "
-            "예: myid/hana  (계정명/저장소명 같은 한글 예시는 사용할 수 없습니다.)"
+            "예: ssinsali/hana"
         )
     if not _REPO_RE.match(repo):
         raise RuntimeError(
             f"Secrets [github].repo 형식이 올바르지 않습니다: {repo!r}. "
-            "영문 owner/repo 형식이어야 합니다. 예: myid/hana"
+            "영문 owner/repo 형식이어야 합니다. 예: ssinsali/hana"
         )
     try:
         path.encode("ascii")
@@ -148,8 +168,9 @@ def _github_request(
             return json.loads(raw) if raw else {}
     except UnicodeEncodeError as e:
         raise RuntimeError(
-            "GitHub 요청 URL에 한글 등 비ASCII 문자가 있습니다. "
-            "Secrets의 repo 값을 영문 owner/repo 로 바꿔 주세요. 예: myid/hana"
+            "GitHub 요청에 한글 등 비ASCII 문자가 있습니다. "
+            "Secrets의 token/repo 를 다시 확인해 주세요. "
+            "token은 GitHub에서 복사한 영문 실제 값이어야 합니다."
         ) from e
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="replace")
