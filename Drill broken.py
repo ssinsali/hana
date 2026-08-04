@@ -66,6 +66,7 @@ from equipment_layout import (
     sidebar_occupies_row,
 )
 from auth import is_admin, render_auth_gate, render_logout_controls
+from gemini_insight import render_gemini_insight
 from image_analyzer import analyze_dashboard_image
 
 _DATA_PATH = _APP_DIR / "data" / "breakage_data.json"
@@ -837,6 +838,14 @@ _show_period_filter_banner()
 
 filtered_counts = _filtered_equipment_counts(tracker)
 metrics = _breakage_metrics(tracker)
+
+render_gemini_insight(
+    _display_detail_df(tracker),
+    map_metrics=metrics,
+    key_prefix="gemini_top",
+)
+st.divider()
+
 m1, m2, m3, m4 = st.columns(4)
 with m1:
     st.metric("총 파손 발생", f"{metrics['total_events']} 회")
