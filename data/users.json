@@ -9,6 +9,11 @@
       "password_hash": "pbkdf2_sha256$260000$000c72721bd4b5658a1408c58fdead66$f0ab3a3ccf42ccf239b3274a93f2202cbd4cf106c6bed86d71f064bc1b494c53",
       "display_name": "김준영",
       "role": "user"
+    },
+    "syun1004": {
+      "password_hash": "pbkdf2_sha256$260000$7d42104f819dad9e94d5c59e48aff1af$653dabf86a0005048c2b7152fd52196cd45980885f9d4adde0fe8333e4a4b5ac",
+      "display_name": "경세현",
+      "role": "user"
     }
   }
 }
