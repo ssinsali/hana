@@ -66,6 +66,13 @@ from equipment_layout import (
     sidebar_occupies_row,
 )
 from auth import is_admin, render_auth_gate, render_logout_controls
+from event_persist import (
+    cloud_persist_enabled,
+    ensure_tracker_loaded,
+    event_log_github_path,
+    records_to_csv_bytes,
+    save_tracker,
+)
 from gemini_insight import render_gemini_insight
 from image_analyzer import analyze_dashboard_image
 
@@ -80,12 +87,45 @@ if not render_auth_gate():
 def _get_tracker() -> BreakageTracker:
     if "tracker" not in st.session_state:
         st.session_state.tracker = BreakageTracker(_DATA_PATH)
+    ensure_tracker_loaded(st.session_state.tracker)
     return st.session_state.tracker
+
+
+def _persist(tracker: BreakageTracker) -> None:
+    err = save_tracker(tracker)
+    if err:
+        st.error(f"GitHub 저장 실패: {err}")
+
+
+def _raw_download_buttons(tracker: BreakageTracker, *, key_prefix: str) -> None:
+    """필터 없는 전체 이벤트 로그 Raw 다운로드."""
+    raw_df = _detail_df(tracker)
+    csv_bytes = records_to_csv_bytes(tracker.state.detail_records)
+    json_bytes = raw_df.to_json(orient="records", force_ascii=False, indent=2).encode("utf-8")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button(
+            "Raw CSV 다운로드",
+            data=csv_bytes,
+            file_name="event_log_raw.csv",
+            mime="text/csv",
+            key=f"{key_prefix}_raw_csv",
+            width="stretch",
+        )
+    with c2:
+        st.download_button(
+            "Raw JSON 다운로드",
+            data=json_bytes,
+            file_name="event_log_raw.json",
+            mime="application/json",
+            key=f"{key_prefix}_raw_json",
+            width="stretch",
+        )
 
 
 def _shutdown_app(tracker: BreakageTracker) -> None:
     """Streamlit 서버 프로세스 종료."""
-    tracker.save()
+    save_tracker(tracker)
     os._exit(0)
 
 
@@ -758,6 +798,7 @@ def _render_event_statistics(tracker: BreakageTracker) -> None:
             st.dataframe(matrix, width="stretch")
 
     st.subheader("이벤트 로그 원본")
+    _raw_download_buttons(tracker, key_prefix="stats_raw")
     st.dataframe(detail_df, width="stretch", hide_index=True)
 
 
@@ -774,13 +815,18 @@ with st.sidebar:
         st.header("데이터")
         if st.button("이벤트 로그 초기화", width="stretch"):
             tracker.reset_counts()
-            tracker.save()
+            _persist(tracker)
             st.rerun()
         if st.button("전체 초기화", width="stretch"):
             tracker.reset_all()
-            tracker.save()
+            _persist(tracker)
             st.rerun()
         st.divider()
+
+    st.subheader("Raw 다운로드")
+    st.caption(f"전체 이벤트 로그 {len(tracker.state.detail_records)}건 (필터 미적용)")
+    _raw_download_buttons(tracker, key_prefix="sidebar_raw")
+    st.divider()
 
     st.subheader("파손 형태 필터")
     type_options = breakage_type_options(_detail_df(tracker))
@@ -833,6 +879,21 @@ _render_global_period_selector(_filtered_by_breakage_type(tracker))
 st.caption(
     "맵·통계·요약은 **이벤트 로그** 기준이며, **조회 기간**·사이드바 **파손 형태** 필터가 적용됩니다."
 )
+if cloud_persist_enabled():
+    cnt = st.session_state.get("event_log_count", len(tracker.state.detail_records))
+    st.caption(
+        f"영구 저장: GitHub `{event_log_github_path()}` · {cnt}건 "
+        "(절전 후에도 유지 · 등록/수정 시 자동 반영)"
+    )
+    if st.session_state.get("event_log_load_error"):
+        st.warning(f"GitHub 로드 경고: {st.session_state['event_log_load_error']}")
+    if st.session_state.get("event_log_save_error"):
+        st.error(f"GitHub 저장 오류: {st.session_state['event_log_save_error']}")
+else:
+    st.caption(
+        "영구 저장(GitHub) 미설정 — 로컬 JSON 사용. "
+        "Streamlit Cloud에서는 Secrets `[github]` 토큰을 넣어야 절전 후에도 데이터가 유지됩니다."
+    )
 _show_breakage_type_filter_banner()
 _show_period_filter_banner()
 
@@ -898,7 +959,7 @@ with tab_data:
         if apply_count:
             try:
                 tracker.add_count(count_eq, int(add_n), note="manual_single")
-                tracker.save()
+                _persist(tracker)
                 st.success(f"{count_eq} → 현재 {tracker.get_count(count_eq)}건")
                 st.rerun()
             except ValueError as e:
@@ -958,7 +1019,7 @@ with tab_data:
                             st.error("반영할 이벤트가 없습니다.")
                         else:
                             n = tracker.import_detail_records(records)
-                            tracker.save()
+                            _persist(tracker)
                             st.success(f"{n}건 이벤트 로그 반영 완료")
                             st.rerun()
                 except Exception as e:
@@ -1012,7 +1073,7 @@ with tab_data:
                                 st.error("반영할 데이터가 없습니다.")
                             else:
                                 n = tracker.import_counts(counts, mode=mode_map[import_mode], statuses=None)
-                                tracker.save()
+                                _persist(tracker)
                                 st.success(f"{n}개 설비 · 총 {sum(counts.values())}건 이벤트 로그로 반영")
                                 st.rerun()
                 except Exception as e:
@@ -1047,7 +1108,7 @@ with tab_data:
                             updated += 1
                     except (TypeError, ValueError):
                         pass
-                tracker.save()
+                _persist(tracker)
                 st.success(f"{updated}개 설비 이벤트 로그 건수 조정됨")
                 st.rerun()
 
@@ -1066,7 +1127,7 @@ with tab_upload:
                     grid_right=grid_right,
                 )
                 newly_broken = tracker.update_batch(detected)
-                tracker.save()
+                _persist(tracker)
 
                 det_df = pd.DataFrame(
                     [
@@ -1099,7 +1160,7 @@ with tab_manual:
 
         if st.button("상태 적용", type="primary"):
             was_new = tracker.update_status(eq_id, new_status)
-            tracker.save()
+            _persist(tracker)
             if was_new:
                 st.success(f"{eq_id} 파손 카운트 +1 (총 {tracker.get_count(eq_id)}회)")
             else:
@@ -1113,6 +1174,7 @@ with tab_manual:
 
 with tab_log:
     st.subheader("이벤트 로그")
+    _raw_download_buttons(tracker, key_prefix="log_raw")
     detail_df = _display_detail_df(tracker)
     if detail_df.empty:
         _show_empty_filter_message(tracker)
