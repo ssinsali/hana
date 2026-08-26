@@ -85,10 +85,10 @@ def github_store_enabled() -> bool:
     return True
 
 
-def _github_cfg() -> tuple[str, str, str, str]:
+def _github_auth_cfg() -> tuple[str, str, str]:
+    """(token, repo, branch)."""
     token = (_github_secret("token") or "").strip().strip('"').strip("'")
     repo = (_github_secret("repo") or "").strip().strip("/").strip('"').strip("'")
-    path = (_github_secret("path") or "data/users.json").strip().lstrip("/")
     branch = (_github_secret("branch") or "main").strip() or "main"
 
     if not token or token in _PLACEHOLDER_TOKENS or "실제" in token:
@@ -119,13 +119,57 @@ def _github_cfg() -> tuple[str, str, str, str]:
             "영문 owner/repo 형식이어야 합니다. 예: ssinsali/hana"
         )
     try:
-        path.encode("ascii")
         branch.encode("ascii")
     except UnicodeEncodeError as e:
         raise RuntimeError(
-            "Secrets [github].path / branch 에는 영문·숫자만 사용하세요."
+            "Secrets [github].branch 에는 영문·숫자만 사용하세요."
+        ) from e
+    return token, repo, branch
+
+
+def _github_cfg(path_override: str | None = None) -> tuple[str, str, str, str]:
+    token, repo, branch = _github_auth_cfg()
+    path = (path_override or _github_secret("path") or "data/users.json").strip().lstrip("/")
+    try:
+        path.encode("ascii")
+    except UnicodeEncodeError as e:
+        raise RuntimeError(
+            "Secrets [github].path 에는 영문·숫자만 사용하세요."
         ) from e
     return token, repo, path, branch
+
+
+def github_file_get(path: str) -> tuple[bytes | None, str | None]:
+    """GitHub 저장소 파일 조회. 없으면 (None, None)."""
+    token, repo, file_path, branch = _github_cfg(path)
+    url = _contents_url(repo, file_path, branch)
+    try:
+        info = _github_request("GET", url, token)
+    except RuntimeError as e:
+        if "404" in str(e):
+            return None, None
+        raise
+    content_b64 = str(info.get("content") or "").replace("\n", "")
+    sha = str(info.get("sha") or "") or None
+    if not content_b64:
+        return b"", sha
+    return base64.b64decode(content_b64), sha
+
+
+def github_file_put(path: str, content: bytes, message: str, sha: str | None) -> str | None:
+    """GitHub 저장소 파일 업로드. 새 sha 반환."""
+    token, repo, file_path, branch = _github_cfg(path)
+    url = _contents_url(repo, file_path)
+    body: dict[str, Any] = {
+        "message": message,
+        "content": base64.b64encode(content).decode("ascii"),
+        "branch": branch,
+    }
+    if sha:
+        body["sha"] = sha
+    info = _github_request("PUT", url, token, body)
+    new_sha = (info.get("content") or {}).get("sha") if isinstance(info.get("content"), dict) else None
+    return str(new_sha) if new_sha else sha
 
 
 def _contents_url(repo: str, path: str, branch: str | None = None) -> str:
@@ -174,6 +218,24 @@ def _github_request(
         ) from e
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="replace")
+        if e.code == 401:
+            raise RuntimeError(
+                "GitHub 인증 실패(401). Secrets의 token이 잘못되었거나 만료되었습니다. "
+                "토큰을 다시 발급해 넣어 주세요."
+            ) from e
+        if e.code == 403:
+            raise RuntimeError(
+                "GitHub 권한 부족(403). 토큰에 저장소 Contents 쓰기 권한이 없습니다. "
+                "Fine-grained: Repository access에 ssinsali/hana 선택 + Permissions → "
+                "Contents = Read and write. "
+                "Classic: repo 체크박스 선택 후 Streamlit Secrets의 token을 새 값으로 교체하세요."
+            ) from e
+        if e.code == 404:
+            raise RuntimeError(
+                "GitHub 리소스를 찾을 수 없습니다(404). "
+                "Secrets의 repo(ssinsali/hana)·path·branch 를 확인하세요. "
+                f"상세: {detail}"
+            ) from e
         raise RuntimeError(f"GitHub API {e.code}: {detail}") from e
 
 
@@ -196,36 +258,20 @@ def _save_users_local(data: dict[str, Any]) -> None:
 
 def _fetch_github_users() -> tuple[dict[str, Any], str | None]:
     """(users_data, sha). 파일이 없으면 빈 DB와 sha=None."""
-    token, repo, path, branch = _github_cfg()
-    url = _contents_url(repo, path, branch)
-    try:
-        info = _github_request("GET", url, token)
-    except RuntimeError as e:
-        if "404" in str(e):
-            return {"users": {}}, None
-        raise
-    content_b64 = str(info.get("content") or "").replace("\n", "")
-    sha = str(info.get("sha") or "") or None
-    if not content_b64:
+    raw, sha = github_file_get((_github_secret("path") or "data/users.json").strip().lstrip("/"))
+    if raw is None:
+        return {"users": {}}, None
+    if not raw:
         return {"users": {}}, sha
-    text = base64.b64decode(content_b64).decode("utf-8")
-    return _normalize_users(json.loads(text)), sha
+    return _normalize_users(json.loads(raw.decode("utf-8"))), sha
 
 
 def _push_github_users(data: dict[str, Any], sha: str | None) -> None:
-    token, repo, path, branch = _github_cfg()
-    url = _contents_url(repo, path)
-    content = base64.b64encode(
-        (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-    ).decode("ascii")
-    body: dict[str, Any] = {
-        "message": "chore: update users.json (signup)",
-        "content": content,
-        "branch": branch,
-    }
-    if sha:
-        body["sha"] = sha
-    _github_request("PUT", url, token, body)
+    path = (_github_secret("path") or "data/users.json").strip().lstrip("/")
+    content = (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    new_sha = github_file_put(path, content, "chore: update users.json (signup)", sha)
+    if new_sha:
+        st.session_state["users_db_sha"] = new_sha
 
 
 def _load_users(*, force_remote: bool = False) -> dict[str, Any]:
